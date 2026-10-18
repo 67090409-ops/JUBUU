@@ -1,0 +1,670 @@
+<!DOCTYPE html>
+<!--
+  idea_13.html - โกดังปุ๋ย: กระสอบ 3 ชนิด ก้อนในกระสอบตามแต้มจับก้อน + เส้นแนวโน้มความชื้น + ตรวจสอบสถานะกระสอบ
+                 + พยากรณ์ความชื้นล่วงหน้า 30 นาที / 1 ชั่วโมง (Machine Learning ในเบราว์เซอร์)
+                 + แผนผังโกดัง 2D แสดงความชื้นแต่ละจุดจัดเก็บ สีเขียว/เหลือง/แดงตามระดับความเสี่ยง
+  เปิดแบบนี้: idea_13.html?team=team09  (เปลี่ยนเลขเป็นเลขกลุ่ม)
+  ฟัง bento-aiot/<ทีม>/# (บอร์ดส่ง event ตอนระดับเปลี่ยน และส่งซ้ำเป็นรอบทุก 2 วินาที) และส่งคำสั่งเข้า bento-aiot/<ทีม>/cmd
+  คีย์จากบอร์ด idea_13_fertilizer_store.py: level alert temp_c rh sun_c crop + cake_pts spikes acked
+  คีย์เสริม (ไม่บังคับ) zones: {"U1":63.5,"N3":68.0,...} ค่า %RH รายจุดสำหรับแผนผังโกดัง ถ้าไม่ส่ง หน้านี้ใช้ rh ของเซนเซอร์ + MAP_OFFSET
+  คำสั่งที่ส่งให้บอร์ด: ack, set t_hi, fc (ผลพยากรณ์: {"cmd":"fc","lv":2,"min":N})
+  กฎฝั่งแอป: level 2 และยังไม่ acked = แถบเตือนพร้อมคำสั่งงาน และ spikes เพิ่ม = บันทึกว่าประตูถูกเปิด
+  ระบบตรวจสอบสถานะกระสอบ: เทียบ RH ล่าสุดกับเกณฑ์ของปุ๋ยแต่ละชนิด (กติกาเดียวกับ sack_state ในบอร์ด)
+  broker สาธารณะ ไม่มีรหัสผ่าน ใครก็อ่านและสั่งได้ ห้ามส่งของลับ
+-->
+<html lang="th">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>โกดังปุ๋ย</title>
+<style>
+  :root {
+    --bg: #15171b; --panel: #1f2329; --line: #353b45; --ink: #eceff4; --dim: #9aa3b0;
+    --haz: #ffc300; --ok: #3dbe8b; --warn: #ff9f1c; --bad: #f0433a;
+    --font: system-ui, -apple-system, "Segoe UI", "Noto Sans Thai", "Sarabun", sans-serif;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--ink); font-family: var(--font); line-height: 1.45; }
+  .stripe { height: 10px; background: repeating-linear-gradient(-45deg, var(--haz) 0 14px, #111 14px 28px); }
+  .wrap { max-width: 960px; margin: 0 auto; padding: 14px; }
+  header { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; justify-content: space-between; }
+  h1 { margin: 0; font-size: 22px; color: var(--haz); text-transform: uppercase; }
+  .sub { margin: 2px 0 0; color: var(--dim); font-size: 14px; }
+  .row { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; }
+  .row > * { min-width: 0; }
+  .chip { padding: 5px 12px; border-radius: 4px; border: 1px solid var(--line); font-size: 13px; color: var(--dim); }
+  .chip.on { color: var(--ok); border-color: var(--ok); }
+  input, button, select { font: inherit; border-radius: 4px; border: 1px solid var(--line); background: #0f1114; color: var(--ink); padding: 8px 12px; min-height: 40px; }
+  button { cursor: pointer; font-weight: 700; background: #2a2f37; }
+  button.haz { background: var(--haz); color: #111; border-color: var(--haz); }
+  .alarm { display: none; margin: 12px 0; padding: 12px; border: 3px solid var(--bad); background: #3a1414; font-weight: 700; }
+  .alarm.show { display: block; }
+  .alarm ol { margin: 6px 0 0 18px; padding: 0; font-weight: 400; }
+  .panel { margin-top: 12px; background: var(--panel); border-left: 6px solid var(--haz); padding: 14px; }
+  .panel h2 { margin: 0 0 10px; font-size: 15px; color: var(--haz); }
+  .sacks { display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; text-align: center; }
+  .sacks svg { width: 100%; max-width: 140px; height: auto; }
+  .sacks .name { font-weight: 700; }
+  .sacks .sel { color: var(--haz); }
+  .nums { display: grid; grid-template-columns: repeat(auto-fit, minmax(130px, 1fr)); gap: 10px; }
+  .num { background: #15181d; padding: 10px; }
+  .num b { display: block; font-size: 26px; }
+  .num span { color: var(--dim); font-size: 13px; }
+  canvas { width: 100%; height: 150px; background: #0f1114; display: block; }
+  ul.log { list-style: none; margin: 0; padding: 0; max-height: 220px; overflow: auto; font-size: 14px; font-family: ui-monospace, Menlo, monospace; }
+  ul.log li { padding: 4px 0; border-bottom: 1px solid var(--line); }
+  .lv0 { color: var(--ok); } .lv1 { color: var(--warn); } .lv2 { color: var(--bad); }
+  .muted { color: var(--dim); font-size: 13px; }
+  /* ตารางตรวจสอบสถานะกระสอบ และตารางพยากรณ์ */
+  .tablewrap { overflow-x: auto; }
+  table.check { width: 100%; border-collapse: collapse; font-size: 14px; }
+  table.check th { text-align: left; color: var(--dim); font-weight: 400; font-size: 13px; padding: 4px 8px; border-bottom: 1px solid var(--line); white-space: nowrap; }
+  table.check td { padding: 8px; border-bottom: 1px solid var(--line); vertical-align: middle; }
+  .badge { display: inline-block; padding: 3px 10px; border-radius: 4px; font-weight: 700; font-size: 13px; white-space: nowrap; border: 1px solid currentColor; }
+  .bd0 { color: var(--ok); } .bd1 { color: var(--warn); } .bd2 { color: var(--bad); background: #3a1414; }
+  .summary { margin: 0 0 10px; font-weight: 700; }
+  /* แผนผังโกดัง 2D: เขียว = ปกติ, เหลือง = เฝ้าระวัง, แดง = อันตราย, เทา = ไม่มีข้อมูล */
+  .mapchips { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 10px; }
+  .mchip { padding: 4px 12px; border-radius: 4px; font-size: 13px; font-weight: 700; border: 1px solid currentColor; }
+  .mchip.c0 { color: var(--ok); } .mchip.c1 { color: var(--haz); } .mchip.c2 { color: var(--bad); background: #3a1414; }
+  svg.map { width: 100%; height: auto; display: block; background: #15181d; }
+  .mp { cursor: pointer; }
+  .mp rect { stroke-width: 2; }
+  .mp.s0 rect { fill: rgba(61,190,139,.28); stroke: var(--ok); }
+  .mp.s1 rect { fill: rgba(255,195,0,.30); stroke: var(--haz); }
+  .mp.s2 rect { fill: rgba(240,67,58,.42); stroke: var(--bad); stroke-width: 3; }
+  .mp.sn rect { fill: #2a2f37; stroke: #535b67; }
+  .mp.sel rect, .mp:focus-visible rect { stroke: #fff; stroke-width: 4; }
+  .mp:focus { outline: none; }
+  .mp text { fill: var(--ink); text-anchor: middle; pointer-events: none; }
+  .maplegend { display: flex; flex-wrap: wrap; gap: 14px; margin-top: 8px; font-size: 13px; color: var(--dim); }
+  .maplegend i { display: inline-block; width: 12px; height: 12px; margin-right: 5px; vertical-align: -1px; border: 2px solid; }
+  .mapdetail { margin-top: 10px; padding: 10px 12px; background: #15181d; font-size: 14px; min-height: 44px; }
+  footer { margin: 18px 0 8px; color: var(--dim); font-size: 13px; }
+</style>
+</head>
+<body>
+<div class="stripe"></div>
+<div class="wrap">
+  <header>
+    <div>
+      <h1>โกดังปุ๋ย</h1>
+      <p class="sub">กระสอบไหนจะจับก้อน ดูจากความชื้นเทียบเกณฑ์ของปุ๋ยแต่ละชนิด และพยากรณ์ล่วงหน้า</p>
+    </div>
+    <div class="row">
+      <label class="muted">ทีม <input id="team" size="10" autocomplete="off"></label>
+      <button id="go">เชื่อมต่อ</button>
+      <span id="conn" class="chip">ยังไม่ต่อ</span>
+    </div>
+  </header>
+
+  <div id="alarm" class="alarm" role="alert">
+    ปุ๋ยเริ่มจับก้อน ทำตามนี้:
+    <ol><li>ปิดประตูโกดัง</li><li>ย้ายกระสอบขึ้นแคร่ ห่างผนัง</li><li>กดรับทราบเมื่อทำแล้ว</li></ol>
+  </div>
+
+  <section class="panel">
+    <h2>แผนผังโกดัง <span class="muted">(ความชื้น %RH แต่ละจุดจัดเก็บ กดที่จุดเพื่อดูรายละเอียด)</span></h2>
+    <div id="mapChips" class="mapchips"></div>
+    <svg id="mapSvg" class="map" viewBox="0 0 600 350" role="group" aria-label="แผนผังโกดังปุ๋ย 2 มิติ"></svg>
+    <div class="maplegend">
+      <span><i style="border-color:var(--ok);background:rgba(61,190,139,.28)"></i>ปกติ ✓</span>
+      <span><i style="border-color:var(--haz);background:rgba(255,195,0,.30)"></i>เฝ้าระวัง !</span>
+      <span><i style="border-color:var(--bad);background:rgba(240,67,58,.42)"></i>อันตราย ✕</span>
+      <span><i style="border-color:#535b67;background:#2a2f37"></i>ไม่มีข้อมูล</span>
+    </div>
+    <div id="mapDetail" class="mapdetail">กดที่จุดจัดเก็บเพื่อดูรายละเอียด</div>
+    <p id="mapNote" class="muted"></p>
+  </section>
+
+  <section class="panel">
+    <h2>ตรวจสอบสถานะกระสอบ <span class="muted">(เทียบ %RH ล่าสุดกับเกณฑ์ของปุ๋ยแต่ละชนิด)</span></h2>
+    <p id="summary" class="summary muted">รอข้อมูลจากบอร์ด</p>
+    <div class="tablewrap">
+      <table class="check">
+        <thead>
+          <tr><th>กระสอบ</th><th>สถานะ</th><th>%RH / เกณฑ์</th><th>อยู่ในสถานะนี้มา</th><th>ควรทำ</th></tr>
+        </thead>
+        <tbody id="checkBody"></tbody>
+      </table>
+    </div>
+    <p id="lastSeen" class="muted"></p>
+  </section>
+
+  <section class="panel">
+    <h2>พยากรณ์ความชื้นล่วงหน้า <span class="muted">(ML จากความชื้น+อุณหภูมิย้อนหลัง คาดอีก 30 นาที / 1 ชั่วโมง)</span></h2>
+    <p id="fcSummary" class="summary muted">กำลังสะสมข้อมูล รอข้อมูลจากบอร์ด</p>
+    <div class="tablewrap">
+      <table class="check">
+        <thead>
+          <tr><th>กระสอบ</th><th>RH ตอนนี้</th><th>คาด +30 นาที</th><th>คาด +1 ชม.</th><th>ถึงเกณฑ์ในอีก</th><th>สถานะคาดการณ์</th></tr>
+        </thead>
+        <tbody id="fcBody"></tbody>
+      </table>
+    </div>
+    <canvas id="fcChart" width="900" height="150" style="margin-top:10px"></canvas>
+    <p class="muted">เส้นทึบ = ความชื้นจริง เส้นประเหลือง = ค่าที่โมเดลทำนาย เส้นประสี = เกณฑ์ของแต่ละกระสอบ เมื่อคาดว่าจะเกิน เว็บจะส่งคำสั่ง fc ให้บอร์ดเตือนล่วงหน้า</p>
+    <div class="row">
+      <label class="muted">ความเร็วเวลา
+        <select id="tscale">
+          <option value="1">เวลาจริง (1 นาที = 1 นาที)</option>
+          <option value="10">เร่ง x10</option>
+          <option value="60">เร่ง x60 (1 วินาที = 1 นาที)</option>
+        </select>
+      </label>
+      <button id="sim">จำลองข้อมูล (ทดสอบ)</button>
+    </div>
+  </section>
+
+  <section class="panel">
+    <h2>กระสอบ 3 ชนิด <span class="muted">(สีเข้มขึ้น = ชื้นเข้าใกล้เกณฑ์ ก้อนกลม = แต้มจับก้อน)</span></h2>
+    <div id="sacks" class="sacks"></div>
+  </section>
+
+  <section class="panel">
+    <h2>ตัวเลขจากบอร์ด</h2>
+    <div class="nums">
+      <div class="num"><b id="rh">--</b><span>ความชื้น %RH</span></div>
+      <div class="num"><b id="temp">--</b><span>อุณหภูมิ C</span></div>
+      <div class="num"><b id="cake">--</b><span>แต้มจับก้อนสะสม</span></div>
+      <div class="num"><b id="spikes">--</b><span>ชื้นพุ่ง (ประตูเปิด) ครั้ง</span></div>
+    </div>
+    <p id="mood" class="muted">รอข้อความแรกจากบอร์ด</p>
+  </section>
+
+  <section class="panel">
+    <h2>แนวโน้มความชื้นจาก event <span class="muted">(เส้นแดง = เกณฑ์ปุ๋ยที่บอร์ดเฝ้า)</span></h2>
+    <canvas id="trend" width="900" height="150"></canvas>
+  </section>
+
+  <section class="panel">
+    <h2>สั่งบอร์ด</h2>
+    <div class="row">
+      <button id="ack" class="haz">รับทราบ (ack)</button>
+      <label class="muted">เกณฑ์ร้อนใหม่ <input id="thi" type="number" min="16" max="45" value="38" style="width:80px"> C</label>
+      <button id="set">ส่ง set t_hi</button>
+    </div>
+    <p id="cmdMsg" class="muted"></p>
+  </section>
+
+  <section class="panel">
+    <h2>บันทึกโกดัง</h2>
+    <ul id="log" class="log"></ul>
+    <div class="row" style="margin-top:10px">
+      <button id="csv">ดาวน์โหลด CSV</button>
+      <span id="other" class="muted"></span>
+    </div>
+  </section>
+
+  <footer>
+    <p>ต่อยอดหน้านี้เองได้ (แก้ด้วยตัวเองหรือ vibe coding โดยวาง s2/app/MQTT_CONTRACT_th.md ให้ AI ก่อน)</p>
+    <p>เกณฑ์ใน SACKS ต้องตรงกับ CROPS ในไฟล์บอร์ด และควรใช้ค่าที่ทีมวัดเอง</p>
+  </footer>
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/mqtt@5.16.0/dist/mqtt.min.js"
+        integrity="sha384-9WWboT9UtuPFRlOLq4FygQkcJxzYcpz8SXGkNyCEXM+44n14xzjNlrRKYZwuF/A6" crossorigin="anonymous"></script>
+<script>
+const BROKER_URL = "wss://broker.hivemq.com:8884/mqtt";
+const ROOT = "bento-aiot";
+// ตรงกับ CROPS ในไฟล์บอร์ด (แก้คู่กัน): รหัส, ชื่อ, RH สูงสุดก่อนจับก้อน
+const SACKS = [["urea", "ยูเรีย", 65], ["npk", "สูตรผสม", 70], ["organic", "อินทรีย์", 75]];
+const KNOWN = ["id", "crop", "level", "alert", "temp_c", "rh", "sun_c", "cake_pts", "spikes", "acked", "zones"];
+const MOOD = ["แห้งดี ปุ๋ยร่วน", "เริ่มชื้น", "จับก้อนแล้ว"];
+// สถานะกระสอบ: 0 = RH ไม่เกินเกณฑ์, 1 = เกินไม่เกิน 10, 2 = เกินเกณฑ์เกิน 10 (กติกาเดียวกับบอร์ด)
+const SNAME = ["แห้งดี", "เริ่มชื้น", "เสี่ยงจับก้อน"];
+const SADVICE = ["ปกติ", "เฝ้าดู ระวังประตูเปิดบ่อย", "ปิดประตู ย้ายขึ้นแคร่ ห่างผนัง"];
+const CAKE_MOVE = 10;   // แต้มจับก้อนของกระสอบที่เฝ้าอยู่ เกินนี้ = ควรย้ายขึ้นแคร่
+const SVGNS = "http://www.w3.org/2000/svg";
+const $ = (id) => document.getElementById(id);
+let client = null, team = new URLSearchParams(location.search).get("team") || "";
+let selected = "urea", lastSpikes = null, cake = 0, rhNow = null, lastEventAt = null, prevLevel = null;
+const rows = [], trend = [];
+const sackSt = {};   // รหัส -> {st: สถานะ, since: เวลาที่เข้าสถานะนี้}
+for (const s of SACKS) sackSt[s[0]] = { st: null, since: null };
+$("team").value = team;
+
+function num(v) { return typeof v === "number" && Number.isFinite(v) ? v : null; }
+function hhmm(d) { return d.toTimeString().slice(0, 8); }
+function setStatus(msg, ok) { $("conn").textContent = msg; $("conn").className = ok ? "chip on" : "chip"; }
+function el(tag, attrs) { const e = document.createElementNS(SVGNS, tag); for (const k in attrs) e.setAttribute(k, attrs[k]); return e; }
+function stateOf(rh, lim) { return rh <= lim ? 0 : (rh <= lim + 10 ? 1 : 2); }
+function ago(since) {
+  const s = Math.max(0, Math.floor((Date.now() - since.getTime()) / 1000));
+  if (s < 60) return s + " วินาที";
+  const m = Math.floor(s / 60);
+  return m < 60 ? m + " นาที " + (s % 60) + " วินาที" : Math.floor(m / 60) + " ชม. " + (m % 60) + " นาที";
+}
+function cell(tr, text, cls) {
+  const td = document.createElement("td");
+  if (cls) { const b = document.createElement("span"); b.className = cls; b.textContent = text; td.appendChild(b); }
+  else td.textContent = text;
+  tr.appendChild(td);
+  return td;
+}
+
+// ===== แผนผังโกดัง 2D =====
+// แต่ละกองปุ๋ย (ตาม SACKS) มี 6 จุดจัดเก็บ จุดแถวบนอยู่ลึกสุด จุดแถวล่างอยู่ใกล้ประตู
+// สี: เขียว = ปกติ, เหลือง = เฝ้าระวัง, แดง = อันตราย (ใช้กติกา stateOf เดียวกับตารางตรวจสอบสถานะกระสอบ)
+const MAP_STALE_MS = 20000;    // ไม่มี event เกินนี้ = ไม่มีข้อมูล (สีเทา)
+// ค่าชดเชย %RH ของแต่ละจุดเทียบกับเซนเซอร์ ใส่ได้เมื่อทีมวัดเองแล้ว เช่น {U5: 3, U6: 3} (จุดใกล้ประตูชื้นกว่า)
+const MAP_OFFSET = {};
+const MAPNAME = ["ปกติ", "เฝ้าระวัง", "อันตราย"], MAPMARK = ["✓", "!", "✕"];
+const zoneRh = {};             // ค่ารายจุดที่บอร์ดส่งมาใน d.zones (ถ้ามี)
+let zonesLive = false, mapSel = null;
+const POINTS = [];
+SACKS.forEach(([code, name, lim], zi) => {
+  for (let i = 0; i < 6; i++) {
+    POINTS.push({ id: code[0].toUpperCase() + (i + 1), code, name, lim, x: 40 + zi * 190 + (i % 2) * 80, y: 68 + Math.floor(i / 2) * 72 });
+  }
+});
+
+function pointRh(p) {
+  if (lastEventAt === null || Date.now() - lastEventAt.getTime() > MAP_STALE_MS) return null;
+  if (zoneRh[p.id] !== undefined) return zoneRh[p.id];
+  return rhNow === null ? null : rhNow + (MAP_OFFSET[p.id] || 0);
+}
+function mapText(x, y, size, str, weight) {
+  const t = el("text", { x, y, "font-size": size, "font-weight": weight || 400 });
+  t.textContent = str;
+  return t;
+}
+
+function renderMap() {
+  const svg = $("mapSvg"); svg.textContent = "";
+  // พื้นโกดัง ผนัง ประตู ทางเดิน
+  svg.appendChild(el("rect", { x: 10, y: 10, width: 580, height: 320, fill: "none", stroke: "#535b67", "stroke-width": 4 }));
+  svg.appendChild(el("rect", { x: 250, y: 326, width: 100, height: 8, fill: "#15181d" }));
+  svg.appendChild(el("line", { x1: 30, y1: 296, x2: 570, y2: 296, stroke: "#353b45", "stroke-width": 2, "stroke-dasharray": "8 6" }));
+  const dim = (x, y, s) => { const t = mapText(x, y, 12, s); t.setAttribute("fill", "#9aa3b0"); svg.appendChild(t); };
+  dim(300, 28, "ผนังด้านใน"); dim(300, 316, "ทางเดิน"); dim(300, 347, "ประตูโกดัง");
+  SACKS.forEach(([code, name, lim], zi) => {
+    const t = mapText(40 + zi * 190 + 75, 56, 14, name + " (เกณฑ์ " + lim + ")", 700);
+    t.setAttribute("fill", code === selected ? "#ffc300" : "#eceff4");
+    svg.appendChild(t);
+  });
+  const cnt = [0, 0, 0], danger = [];
+  let none = 0;
+  for (const p of POINTS) {
+    const rh = pointRh(p), st = rh === null ? null : stateOf(rh, p.lim);
+    if (st === null) none++; else { cnt[st]++; if (st === 2) danger.push(p.id); }
+    const g = el("g", { class: "mp " + (st === null ? "sn" : "s" + st) + (mapSel === p.id ? " sel" : ""), tabindex: 0, role: "button",
+      "aria-label": "จุด " + p.id + " " + p.name + " " + (rh === null ? "ไม่มีข้อมูล" : rh.toFixed(0) + " เปอร์เซ็นต์ " + MAPNAME[st]) });
+    g.appendChild(el("rect", { x: p.x, y: p.y, width: 70, height: 64, rx: 4 }));
+    g.appendChild(mapText(p.x + 35, p.y + 16, 11, p.id));
+    g.appendChild(mapText(p.x + 35, p.y + 38, 17, rh === null ? "--" : rh.toFixed(0) + "%", 700));
+    g.appendChild(mapText(p.x + 35, p.y + 55, 11, st === null ? "ไม่มีข้อมูล" : MAPMARK[st] + " " + MAPNAME[st]));
+    g.onclick = () => { mapSel = p.id; renderMap(); };
+    g.onkeydown = (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); mapSel = p.id; renderMap(); } };
+    svg.appendChild(g);
+  }
+  const chips = $("mapChips"); chips.textContent = "";
+  const add = (cls, txt) => { const s = document.createElement("span"); s.className = "mchip " + cls; s.textContent = txt; chips.appendChild(s); };
+  add("c0", "ปกติ " + cnt[0]); add("c1", "เฝ้าระวัง " + cnt[1]); add("c2", "อันตราย " + cnt[2]);
+  if (none) { const s = document.createElement("span"); s.className = "chip"; s.textContent = "ไม่มีข้อมูล " + none; chips.appendChild(s); }
+  if (danger.length) { const s = document.createElement("span"); s.className = "muted"; s.textContent = "ต้องจัดการก่อน: " + danger.join(", "); chips.appendChild(s); }
+  const box = $("mapDetail"), sp = POINTS.find((p) => p.id === mapSel);
+  if (!sp) box.textContent = "กดที่จุดจัดเก็บเพื่อดูรายละเอียด";
+  else {
+    const rh = pointRh(sp), st = rh === null ? null : stateOf(rh, sp.lim);
+    box.textContent = "จุด " + sp.id + " (" + sp.name + ") " + (st === null ? "ยังไม่มีข้อมูลล่าสุดจากบอร์ด" :
+      "RH " + rh.toFixed(1) + " % เกณฑ์ " + sp.lim + " : " + MAPNAME[st] + " ควรทำ: " + SADVICE[st]);
+  }
+  $("mapNote").textContent = zonesLive || Object.keys(MAP_OFFSET).length ? "" :
+    "ตอนนี้ใช้ค่า RH จากเซนเซอร์ตัวเดียว จุดในกองเดียวกันจึงมีค่าเท่ากัน ถ้าวัดได้หลายจุด ให้ส่ง zones จากบอร์ดหรือใส่ MAP_OFFSET";
+}
+
+// ตรวจสอบสถานะกระสอบ: เทียบ RH ล่าสุดกับเกณฑ์ของแต่ละชนิด จดเวลาเข้าสถานะ และลงบันทึกเมื่อสถานะเปลี่ยน
+function updateSacks(rh, now) {
+  for (const [code, name, lim] of SACKS) {
+    const st = stateOf(rh, lim), rec = sackSt[code];
+    if (st !== rec.st) {
+      if (rec.st !== null) logLine(hhmm(now) + "  กระสอบ" + name + ": " + SNAME[rec.st] + " -> " + SNAME[st], "lv" + st);
+      rec.st = st; rec.since = now;
+    }
+  }
+}
+
+function renderCheck() {
+  const body = $("checkBody"); body.textContent = "";
+  if (rhNow === null) { $("summary").textContent = "รอข้อมูลจากบอร์ด"; $("summary").className = "summary muted"; return; }
+  let watch = 0, worst = 0;
+  for (const [code, name, lim] of SACKS) {
+    const rec = sackSt[code];
+    if (rec.st === null) continue;
+    let advice = SADVICE[rec.st], st = rec.st;
+    // กระสอบที่บอร์ดเฝ้าอยู่: แต้มจับก้อนสะสมเกินเกณฑ์ ให้ย้ายขึ้นแคร่แม้ RH ตอนนี้ลดลงแล้ว
+    if (code === selected && cake >= CAKE_MOVE) { advice = "แต้มจับก้อนเกิน " + CAKE_MOVE + ": ย้ายขึ้นแคร่"; st = Math.max(st, 1); }
+    if (st > 0) watch++;
+    worst = Math.max(worst, st);
+    const tr = document.createElement("tr");
+    cell(tr, name + (code === selected ? " (เฝ้าอยู่)" : ""));
+    cell(tr, SNAME[rec.st], "badge bd" + rec.st);
+    cell(tr, rhNow.toFixed(1) + " / " + lim + "  (" + Math.round(rhNow * 100 / lim) + "%)");
+    cell(tr, ago(rec.since));
+    cell(tr, advice);
+    body.appendChild(tr);
+  }
+  $("summary").textContent = watch === 0 ? "ทุกกระสอบปกติ" : watch + " จาก " + SACKS.length + " กระสอบต้องระวัง";
+  $("summary").className = "summary lv" + worst;
+  $("lastSeen").textContent = lastEventAt ? "ข้อมูลล่าสุดจากบอร์ด " + hhmm(lastEventAt) + " (บอร์ดส่งซ้ำทุก 2 วินาที)" : "";
+}
+
+// วาดกระสอบใหม่ทั้งชุด: ความสูงสีตาม RH / เกณฑ์ ก้อนกลมในกระสอบที่บอร์ดเฝ้า = แต้มจับก้อน
+function drawSacks() {
+  const box = $("sacks"); box.textContent = "";
+  for (const [code, name, lim] of SACKS) {
+    const frac = rhNow === null ? 0 : Math.min(1.3, rhNow / lim);
+    const col = frac <= 1 ? "#3dbe8b" : (frac <= (lim + 10) / lim ? "#ff9f1c" : "#f0433a");
+    const svg = el("svg", { viewBox: "0 0 120 150" });
+    svg.appendChild(el("path", { d: "M20 20 Q60 4 100 20 L108 138 Q60 150 12 138 Z", fill: "#2a2f37", stroke: "#535b67", "stroke-width": 2 }));
+    const h = Math.min(1, frac) * 110;
+    svg.appendChild(el("rect", { x: 18, y: 136 - h, width: 84, height: h, fill: col, opacity: 0.55 }));
+    if (code === selected) {
+      const lumps = Math.min(12, Math.floor(cake));
+      for (let i = 0; i < lumps; i++) {
+        svg.appendChild(el("circle", { cx: 32 + (i % 4) * 19, cy: 124 - Math.floor(i / 4) * 18, r: 8, fill: "#e9e3d3", stroke: "#8a816b" }));
+      }
+    }
+    const t = el("text", { x: 60, y: 80, "text-anchor": "middle", fill: "#eceff4", "font-size": 18, "font-weight": 700 });
+    t.textContent = rhNow === null ? "--" : Math.round(frac * 100) + "%";
+    svg.appendChild(t);
+    const cellDiv = document.createElement("div");
+    const nm = document.createElement("div");
+    nm.className = "name" + (code === selected ? " sel" : "");
+    nm.textContent = name + (code === selected ? " (เฝ้าอยู่)" : "");
+    const lm = document.createElement("div");
+    lm.className = "muted"; lm.textContent = "เกณฑ์ " + lim + " %RH";
+    cellDiv.append(svg, nm, lm);
+    box.appendChild(cellDiv);
+  }
+}
+
+function drawTrend() {
+  const c = $("trend"), g = c.getContext("2d");
+  g.clearRect(0, 0, c.width, c.height);
+  const lim = (SACKS.find((s) => s[0] === selected) || SACKS[0])[2];
+  const y = (v) => c.height - (Math.max(0, Math.min(100, v)) / 100) * c.height;
+  g.strokeStyle = "#f0433a"; g.setLineDash([6, 4]); g.beginPath(); g.moveTo(0, y(lim)); g.lineTo(c.width, y(lim)); g.stroke();
+  g.setLineDash([]);
+  if (trend.length < 1) return;
+  g.strokeStyle = "#ffc300"; g.lineWidth = 3; g.beginPath();
+  trend.forEach((v, i) => { const x = trend.length === 1 ? c.width / 2 : i * c.width / (trend.length - 1); i ? g.lineTo(x, y(v)) : g.moveTo(x, y(v)); });
+  g.stroke();
+  g.fillStyle = "#ffc300";
+  trend.forEach((v, i) => { const x = trend.length === 1 ? c.width / 2 : i * c.width / (trend.length - 1); g.fillRect(x - 3, y(v) - 3, 6, 6); });
+}
+
+function logLine(text, cls) {
+  const li = document.createElement("li");
+  li.textContent = text;
+  if (cls) li.className = cls;
+  $("log").prepend(li);
+  while ($("log").children.length > 80) $("log").lastChild.remove();
+}
+
+// ===== พยากรณ์ความชื้นล่วงหน้า (Machine Learning แบบ RLS ในเบราว์เซอร์) =====
+const HZ = [30, 60];                 // ล่วงหน้ากี่นาที
+const FK = 5, MIN_TRAIN = 15, MAXHIST = 140;
+const FC_COLOR = { urea: "#3dbe8b", npk: "#ff9f1c", organic: "#7aa2ff" };
+let tscale = 1, vbase = 0, rbase = Date.now(), fcSent = 0;
+function vNow() { return vbase + (Date.now() - rbase) / 60000 * tscale; }   // นาทีเสมือน
+function setScale(s) { vbase = vNow(); rbase = Date.now(); tscale = s; }
+
+class RLS {
+  constructor(n, lam = 0.98, delta = 100) {
+    this.n = n; this.lam = lam; this.count = 0;
+    this.w = new Array(n).fill(0);
+    this.P = Array.from({ length: n }, (_, i) => Array.from({ length: n }, (_, j) => (i === j ? delta : 0)));
+  }
+  predict(x) { return this.w.reduce((s, w, i) => s + w * x[i], 0); }
+  update(x, y) {
+    const P = this.P;
+    const Px = P.map((row) => row.reduce((s, p, j) => s + p * x[j], 0));
+    const den = this.lam + x.reduce((s, xi, i) => s + xi * Px[i], 0);
+    const k = Px.map((p) => p / den);
+    const err = y - this.predict(x);
+    this.w = this.w.map((w, i) => w + k[i] * err);
+    this.P = P.map((row, i) => row.map((p, j) => (p - k[i] * Px[j]) / this.lam));
+    this.count++;
+  }
+}
+
+const fc = { grid: [], last: null, nextT: 0, models: {}, mae: {}, level: {} };
+for (const h of HZ) { fc.models[h] = new RLS(5); fc.mae[h] = null; }
+for (const s of SACKS) fc.level[s[0]] = null;
+
+function fcFeat(i) {   // ฟีเจอร์: RH, ความชันของ RH, อุณหภูมิ, ความชันของอุณหภูมิ
+  const g = fc.grid, cur = g[i], prev = g[i - FK];
+  return [1, (cur[0] - 60) / 10, (cur[0] - prev[0]) / FK * 5, (cur[1] - 30) / 10, (cur[1] - prev[1]) / FK * 5];
+}
+
+function fcPush(h, tp) {   // ใส่ตัวอย่างทุก 1 นาทีเสมือน แล้วสอนโมเดล
+  fc.grid.push([h, tp]);
+  if (fc.grid.length > MAXHIST) fc.grid.shift();
+  const n = fc.grid.length;
+  for (const hz of HZ) {
+    if (n > hz + FK) {
+      const i = n - 1 - hz, x = fcFeat(i), y = h - fc.grid[i][0], m = fc.models[hz];
+      if (m.count >= MIN_TRAIN) {   // วัดความคลาดเคลื่อนก่อนเรียนรู้ (ไว้เป็นหลักฐาน)
+        const e = Math.abs(m.predict(x) - y);
+        fc.mae[hz] = fc.mae[hz] === null ? e : 0.9 * fc.mae[hz] + 0.1 * e;
+      }
+      m.update(x, y);
+    }
+  }
+}
+
+function fcFeed(rh, temp) {   // event มาไม่สม่ำเสมอ จึงแทรกค่าเป็นตารางทุก 1 นาที
+  const t = vNow();
+  if (fc.last === null) { fc.last = { t, rh, temp: temp ?? 30 }; fc.nextT = t + 1; fcPush(rh, temp ?? 30); return; }
+  const a = fc.last, tp = temp ?? a.temp;
+  if (t - fc.nextT > MAXHIST) { fc.grid = []; fc.nextT = t; }   // หายไปนานมาก เริ่มสะสมใหม่
+  while (fc.nextT <= t) {
+    const f = t > a.t ? (fc.nextT - a.t) / (t - a.t) : 1;
+    fcPush(a.rh + (rh - a.rh) * f, a.temp + (tp - a.temp) * f);
+    fc.nextT += 1;
+  }
+  fc.last = { t, rh, temp: tp };
+}
+
+function fcForecast() {
+  const g = fc.grid, n = g.length;
+  if (n <= FK) return null;
+  const h = g[n - 1][0], x = fcFeat(n - 1), slope = (h - g[n - 1 - FK][0]) / FK;
+  const out = { h, mode: "trend", p: {} };
+  for (const hz of HZ) {
+    const m = fc.models[hz];
+    let d;
+    if (m.count >= MIN_TRAIN) { d = m.predict(x); out.mode = "ml"; } else d = slope * hz;
+    out.p[hz] = h + Math.max(-15, Math.min(15, d));
+  }
+  return out;
+}
+
+function fcRisk(h, p30, p60, lim) {
+  if (h > lim) return [2, "เกินเกณฑ์แล้ว"];
+  if (p30 > lim) return [2, "คาดเกินใน 30 นาที"];
+  if (p60 > lim) return [1, "คาดเกินใน 1 ชั่วโมง"];
+  if (p60 > lim - 2) return [1, "เฝ้าระวัง ใกล้เกณฑ์"];
+  return [0, "ปลอดภัยใน 1 ชม."];
+}
+
+function renderForecast() {
+  const f = fcForecast(), body = $("fcBody");
+  body.textContent = "";
+  if (!f) {
+    $("fcSummary").textContent = "กำลังสะสมข้อมูล (มี " + fc.grid.length + " ตัวอย่าง ต้องมากกว่า " + FK + ")";
+    $("fcSummary").className = "summary muted";
+    drawForecast(null);
+    return;
+  }
+  const p30 = f.p[HZ[0]], p60 = f.p[HZ[1]], rate = (p60 - f.h) / HZ[1];
+  let worst = 0, first = null, minEta = null;
+  for (const [code, name, lim] of SACKS) {
+    const [lv, txt] = fcRisk(f.h, p30, p60, lim);
+    let eta = "-";
+    if (f.h > lim) eta = "เกินแล้ว";
+    else if (rate > 0 && (lim - f.h) / rate <= 180) eta = Math.round((lim - f.h) / rate) + " นาที";
+    const tr = document.createElement("tr");
+    cell(tr, name); cell(tr, f.h.toFixed(1) + " %");
+    cell(tr, p30.toFixed(1) + " %"); cell(tr, p60.toFixed(1) + " %");
+    cell(tr, eta); cell(tr, txt, "badge bd" + lv);
+    body.appendChild(tr);
+    worst = Math.max(worst, lv);
+    if (lv === 2 && first === null) first = name;
+    if (lv === 2 && f.h <= lim && rate > 0) {
+      const e = Math.round((lim - f.h) / rate);
+      if (minEta === null || e < minEta) minEta = e;
+    }
+    if (fc.level[code] !== null && lv > fc.level[code])   // ลงบันทึกเมื่อความเสี่ยงเพิ่มขึ้น
+      logLine(hhmm(new Date()) + "  พยากรณ์: กระสอบ" + name + " " + txt, "lv" + lv);
+    fc.level[code] = lv;
+  }
+  // ส่งผลพยากรณ์กลับให้บอร์ดเตือนล่วงหน้า (ส่งเมื่อสถานะเปลี่ยนเท่านั้น)
+  const lvSend = worst >= 2 ? 2 : 0;
+  if (lvSend !== fcSent && client && client.connected) {
+    client.publish(ROOT + "/" + team + "/cmd", JSON.stringify({ cmd: "fc", lv: lvSend, min: Math.min(minEta === null ? 0 : minEta, 999) }));
+    fcSent = lvSend;
+  }
+  const mae = fc.mae[HZ[0]];
+  $("fcSummary").textContent = (worst === 2 ? "แก้ไขก่อนเกิดปัญหา: กระสอบ" + first + " มีแนวโน้มเกินเกณฑ์ภายใน 30 นาที" :
+    worst === 1 ? "เฝ้าระวัง: มีกระสอบที่อาจเกินเกณฑ์ภายใน 1 ชั่วโมง" : "ทุกกระสอบปลอดภัยใน 1 ชั่วโมงข้างหน้า") +
+    "  [" + (f.mode === "ml" ? "โหมด ML" : "โหมดแนวโน้ม (ML กำลังเรียนรู้)") + " | ข้อมูล " + fc.grid.length + " นาที" +
+    (mae === null ? "" : " | คลาดเคลื่อน ±" + mae.toFixed(2) + " %RH") + "]";
+  $("fcSummary").className = "summary lv" + worst;
+  drawForecast(f);
+}
+
+function drawForecast(f) {
+  const c = $("fcChart"), g = c.getContext("2d"), W = c.width, H = c.height;
+  g.clearRect(0, 0, W, H);
+  const lo = 40, hi = 100, X = (i) => i / 120 * W, Y = (v) => H - (Math.max(lo, Math.min(hi, v)) - lo) / (hi - lo) * H;
+  g.font = "12px sans-serif";
+  for (const [code, name, lim] of SACKS) {
+    g.strokeStyle = FC_COLOR[code]; g.setLineDash([6, 4]); g.lineWidth = 1;
+    g.beginPath(); g.moveTo(0, Y(lim)); g.lineTo(W, Y(lim)); g.stroke();
+    g.fillStyle = FC_COLOR[code]; g.fillText(name + " " + lim, 4, Y(lim) - 3);
+  }
+  g.setLineDash([]);
+  g.strokeStyle = "#535b67"; g.beginPath(); g.moveTo(X(60), 0); g.lineTo(X(60), H); g.stroke();   // เส้น "ตอนนี้"
+  if (!f) return;
+  const hist = fc.grid.slice(-60).map((v) => v[0]), nh = hist.length;
+  g.strokeStyle = "#eceff4"; g.lineWidth = 3; g.beginPath();
+  hist.forEach((v, j) => { const x = X(60 - (nh - 1 - j)); j ? g.lineTo(x, Y(v)) : g.moveTo(x, Y(v)); });
+  g.stroke();
+  g.strokeStyle = "#ffc300"; g.setLineDash([8, 5]); g.beginPath();
+  g.moveTo(X(60), Y(f.h)); g.lineTo(X(90), Y(f.p[HZ[0]])); g.lineTo(X(120), Y(f.p[HZ[1]])); g.stroke();
+  g.setLineDash([]); g.fillStyle = "#ffc300";
+  g.fillText("+30", X(90) - 10, Y(f.p[HZ[0]]) - 6); g.fillText("+60", X(120) - 28, Y(f.p[HZ[1]]) - 6);
+}
+
+// จำลองข้อมูลความชื้นที่ค่อยๆ สูงขึ้น ไว้ทดสอบและถ่ายหลักฐานโดยไม่ต้องรอบอร์ด
+let simTimer = null, simRh = 55, simT = 30;
+function toggleSim() {
+  if (simTimer) { clearInterval(simTimer); simTimer = null; $("sim").textContent = "จำลองข้อมูล (ทดสอบ)"; return; }
+  $("tscale").value = "60"; setScale(60);
+  simRh = 55; simT = 30; $("sim").textContent = "หยุดจำลอง";
+  logLine(hhmm(new Date()) + "  เริ่มจำลองข้อมูล (ไม่ใช่ค่าจากบอร์ด)", "lv1");
+  simTimer = setInterval(() => {
+    simT += (Math.random() - 0.45) * 0.3;
+    simRh = Math.min(92, simRh + 0.15 + 0.03 * (simT - 30) + (Math.random() - 0.5) * 0.4);
+    const lim = (SACKS.find((s) => s[0] === selected) || SACKS[0])[2];
+    onEvent({ level: stateOf(simRh, lim), alert: "จำลอง", temp_c: simT, rh: simRh, crop: selected, cake_pts: cake, spikes: lastSpikes === null ? 0 : lastSpikes });
+  }, 1000);
+}
+
+function onEvent(d) {
+  const level = Number.isInteger(d.level) && d.level >= 0 && d.level <= 2 ? d.level : null;
+  const t = num(d.temp_c), rh = num(d.rh), sun = num(d.sun_c), pts = num(d.cake_pts), sp = num(d.spikes);
+  const now = new Date();
+  lastEventAt = now;
+  if (typeof d.crop === "string" && SACKS.some((s) => s[0] === d.crop)) selected = d.crop;
+  if (d.zones && typeof d.zones === "object" && !Array.isArray(d.zones)) {   // ค่า %RH รายจุด (ไม่บังคับ)
+    for (const p of POINTS) { const v = num(d.zones[p.id]); if (v !== null) { zoneRh[p.id] = v; zonesLive = true; } }
+  }
+  if (rh !== null) {
+    rhNow = rh; $("rh").textContent = rh.toFixed(1);
+    trend.push(rh); if (trend.length > 150) trend.shift();
+    updateSacks(rh, now); fcFeed(rh, t);
+  }
+  if (t !== null) $("temp").textContent = t.toFixed(1);
+  if (pts !== null) { cake = pts; $("cake").textContent = pts.toFixed(1); }
+  if (sp !== null) {
+    $("spikes").textContent = String(sp);
+    if (lastSpikes !== null && sp > lastSpikes) logLine(hhmm(now) + "  ความชื้นพุ่ง: ประตูอาจถูกเปิด (ครั้งที่ " + sp + ")", "lv1");
+    lastSpikes = sp;
+  }
+  if (level !== null) {
+    $("mood").textContent = MOOD[level] + (level && typeof d.alert === "string" ? " (" + d.alert.slice(0, 30) + ")" : "");
+    $("mood").className = "lv" + level;
+    $("alarm").className = (level === 2 && d.acked !== 1) ? "alarm show" : "alarm";
+  }
+  drawSacks(); drawTrend(); renderCheck(); renderForecast(); renderMap();
+  const extra = Object.keys(d).filter((k) => !KNOWN.includes(k));
+  $("other").textContent = extra.length ? "คีย์ที่หน้านี้ยังไม่รู้จัก: " + extra.slice(0, 6).join(", ") : "";
+  rows.push([now.toISOString(), level, t, rh, sun, pts, sp, typeof d.alert === "string" ? d.alert : ""]);
+  if (level !== prevLevel) {   // บอร์ดส่งซ้ำทุก 2 วินาที ลงบันทึกเฉพาะตอนระดับเปลี่ยน
+    prevLevel = level;
+    logLine(hhmm(now) + "  " + (level === null ? "?" : MOOD[level]) + "  RH " + (rh === null ? "--" : rh.toFixed(1)) +
+      "  แต้ม " + (pts === null ? "--" : pts.toFixed(1)), level === null ? "" : "lv" + level);
+  }
+}
+
+function send(obj, label) {
+  if (!client || !client.connected) { $("cmdMsg").textContent = "ยังไม่ได้ต่อ broker คำสั่งยังไม่ถึงบอร์ด"; return false; }
+  client.publish(ROOT + "/" + team + "/cmd", JSON.stringify(obj));
+  $("cmdMsg").textContent = "ส่งแล้ว: " + label + " " + hhmm(new Date());
+  return true;
+}
+
+function csvCell(v) { const s = v === null || v === undefined ? "" : String(v); return /[",\r\n]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s; }
+function downloadCsv() {
+  const head = ["time", "level", "temp_c", "rh", "sun_c", "cake_pts", "spikes", "alert"];
+  const lines = [head.join(",")].concat(rows.map((r) => r.map(csvCell).join(",")));
+  const blob = new Blob(["\uFEFF" + lines.join("\r\n")], { type: "text/csv;charset=utf-8" });   // BOM ให้ Excel อ่านไทยได้
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url; a.download = "fertilizer_store_" + team + ".csv";
+  document.body.appendChild(a); a.click(); a.remove();
+  URL.revokeObjectURL(url);
+}
+
+function connect() {
+  team = $("team").value.trim();
+  if (!/^team[0-9a-z_]{2,20}$/.test(team) || team === "team00") { setStatus("ใส่เลขทีม เช่น team09", false); return; }
+  if (typeof mqtt === "undefined") { setStatus("โหลดไลบรารี MQTT ไม่ได้ ตรวจเน็ต", false); return; }
+  if (client) client.end(true);
+  setStatus("กำลังต่อ " + team, false);
+  client = mqtt.connect(BROKER_URL, { clientId: "fert-web-" + Math.random().toString(16).slice(2, 10), connectTimeout: 20000 });
+  client.on("connect", () => { setStatus("ต่อแล้ว " + team, true); client.subscribe(ROOT + "/" + team + "/#"); fcSent = 0; });
+  client.on("close", () => setStatus("หลุด กำลังต่อใหม่", false));
+  client.on("message", (topic, payload) => {
+    if (!topic.endsWith("/event")) return;
+    let d = null;
+    try { d = JSON.parse(payload.toString()); } catch (e) { return; }
+    if (d && typeof d === "object" && !Array.isArray(d)) onEvent(d);
+  });
+}
+
+$("go").onclick = connect;
+$("ack").onclick = () => { if (send({ cmd: "ack" }, "รับทราบ")) $("alarm").className = "alarm"; };
+$("set").onclick = () => {
+  const v = Number($("thi").value);
+  if (!Number.isInteger(v) || v < 16 || v > 45) { $("cmdMsg").textContent = "เกณฑ์ต้องเป็นจำนวนเต็ม 16-45"; return; }
+  send({ cmd: "set", t_hi: v }, "t_hi " + v);
+};
+$("csv").onclick = downloadCsv;
+$("tscale").onchange = () => setScale(Number($("tscale").value));
+$("sim").onclick = toggleSim;
+drawSacks();
+drawTrend();
+renderCheck();
+renderForecast();
+renderMap();
+setInterval(renderCheck, 1000);   // ให้ "อยู่ในสถานะนี้มา" เดินทุกวินาที
+setInterval(renderMap, 5000);     // ให้แผนผังเปลี่ยนเป็นสีเทาเมื่อบอร์ดเงียบเกิน 20 วินาที
+if (team) connect(); else setStatus("ใส่เลขทีมแล้วกดเชื่อมต่อ", false);
+</script>
+</body>
+</html>
